@@ -1,1385 +1,671 @@
-# JSONB DML Query Analysis Report — RDS Configuration Sections
+# Accounting Ledger Service
 
-> **Scope**: Analysis of all `## RDS Configuration` sections across the changelogs in this repository.
-> **Files Reviewed**: 50+ changelog files across RTB-18000 to RTB-23999 ranges
-> **Focus**: Identifying, cataloguing, and classifying every PostgreSQL JSONB DML pattern used
+> **Version**: See `changelog.md` for change history  
+> **Default Port**: `10087`  
+> **Runtime**: Python 3.10 / Flask 1.1.4  
+> **Deployment**: Dockerized, AWS (EC2 + S3 + DynamoDB)
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Summary Table of JSONB Patterns Found](#summary-table-of-jsonb-patterns-found)
-3. [Pattern 1 — Field Access Operators (`->` and `->>`)](#pattern-1--field-access-operators---and----)
-4. [Pattern 2 — `jsonb_set()` for Nested Updates](#pattern-2--jsonb_set-for-nested-updates)
-5. [Pattern 3 — `||` Concatenation / Merge Operator](#pattern-3----concatenation--merge-operator)
-6. [Pattern 4 — `?` Key Existence Check](#pattern-4----key-existence-check)
-7. [Pattern 5 — `#>` and `#>>` Path Operators](#pattern-5--and--path-operators)
-8. [Pattern 6 — `@>` Containment Operator](#pattern-6----containment-operator)
-9. [Pattern 7 — `jsonb_agg()` Aggregation](#pattern-7--jsonb_agg-aggregation)
-10. [Pattern 8 — `jsonb_build_object()` Construction](#pattern-8--jsonb_build_object-construction)
-11. [Pattern 9 — `jsonb_array_elements()` Lateral Unnesting](#pattern-9--jsonb_array_elements-lateral-unnesting)
-12. [Pattern 10 — `jsonb_array_length()`](#pattern-10--jsonb_array_length)
-13. [Pattern 11 — `jsonb_build_array()`](#pattern-11--jsonb_build_array)
-14. [Pattern 12 — `::jsonb` Cast Literals in INSERT/UPDATE](#pattern-12---jsonb-cast-literals-in-insertupdate)
-15. [Pattern 13 — `COALESCE(col, '{}'::jsonb)`](#pattern-13--coalescecolumnjsonb)
-16. [Pattern 14 — `INSERT INTO` with Embedded JSONB Schema](#pattern-14--insert-into-with-embedded-jsonb-schema)
-17. [Pattern 15 — `RETURNS TABLE(data jsonb)` in PL/pgSQL Functions](#pattern-15--returns-tabledata-jsonb-in-plpgsql-functions)
-18. [Pattern 16 — Trigger Functions Using JSONB Navigation](#pattern-16--trigger-functions-using-jsonb-navigation)
-19. [Pattern 17 — CTE with Conditional JSONB Updates](#pattern-17--cte-with-conditional-jsonb-updates)
-20. [Pattern 18 — `jsonb_set` Inside `document_attributes` and `statuses` Arrays](#pattern-18--jsonb_set-inside-document_attributes-and-statuses-arrays)
-21. [Catalogue of Tables Targeted](#catalogue-of-tables-targeted)
-22. [Learning Guide — What to Study](#learning-guide--what-to-study)
-23. [Assessment Question Sets](#assessment-question-sets)
+1. [Service Overview](#1-service-overview)
+2. [Project Structure & Module Responsibilities](#2-project-structure--module-responsibilities)
+3. [High-Level Architecture](#3-high-level-architecture)
+4. [End-to-End Service Flow](#4-end-to-end-service-flow)
+5. [Critical Code Walkthrough](#5-critical-code-walkthrough)
+6. [Configuration & Environment Setup](#6-configuration--environment-setup)
+7. [Failure Scenarios & Debugging Guide](#7-failure-scenarios--debugging-guide)
+8. [Operational & Infra Considerations](#8-operational--infra-considerations)
+9. [Local Development & Runbook](#9-local-development--runbook)
 
 ---
 
-## Overview
+## 1. Service Overview
 
-The changelogs in this repository are deployment instructions for the **INCENTIHUB** platform. The `## RDS Configuration` sections contain raw PostgreSQL DML scripts that configure the platform's data layer. The system heavily uses **JSONB columns** to store semi-structured data such as:
+### Business Problem
 
-- `core_attributes` — core entity data (agent codes, names, dates, finance figures)
-- `additional_attributes` — lookup data, RTB-specific fields
-- `system_attributes` — audit/status metadata (last_modified_date, created_by, etc.)
-- `si_input_schema` / `si_output_schema` — JSON Schema structures for service interactions
-- `processor_schema` — preprocessor/postprocessor configuration
-- `statuses` / `stage_status` — workflow status machine definitions
-- `document_attributes` — document handling metadata
-- `allowed_stages` — permissions/stage configuration (stored as JSON array in text, cast to jsonb)
+In the InsentiHub incentive-compensation platform, agents earn commissions and entitlements across multiple payout lifecycle stages. Each financial event (provisioning, accrual, tax liability, settlement) must generate corresponding **double-entry accounting ledger records** in the client's General Ledger (GL) system. Without these records, the finance team cannot reconcile payouts, comply with GST/TDS regulations, or produce accurate financial statements.
 
-All queries operate on tables such as `agent`, `service_interaction`, `service_registry`, `object_repository`, `parenttxn`, `childtxn`, `entitytype`, and their staging variants.
+### Core Responsibilities
 
----
+| Responsibility | Description |
+|---|---|
+| **GL Entry Generation** | Produces balanced CR/DR pairs for every accounting rule invocation |
+| **Multi-Stage Support** | Handles Provisional, Accrual, Settlement, and Adjustment stages |
+| **Tax-Aware Entries** | Generates GST (RCM/FCM), Withholding Tax, and Local Tax entries |
+| **Idempotency / Deduplication** | Prevents duplicate ledger records by comparing against existing DB entries |
+| **Bulk Upload Orchestration** | Creates a Batch, uploads a CSV file, and triggers bulk processing via the platform's batch API |
 
-## Summary Table of JSONB Patterns Found
+### Explicit Non-Responsibilities
 
-| # | Pattern | SQL Feature Used | DML Type | Frequency |
-|---|---------|-----------------|----------|-----------|
-| 1 | Read single field as text | `->>` | SELECT/WHERE | ⭐⭐⭐⭐⭐ Very High |
-| 2 | Read nested JSONB object | `->` | SELECT/WHERE | ⭐⭐⭐⭐⭐ Very High |
-| 3 | Set/overwrite nested field | `jsonb_set()` | UPDATE | ⭐⭐⭐⭐⭐ Very High |
-| 4 | Merge/append to JSONB object | `\|\|` operator | UPDATE | ⭐⭐⭐⭐ High |
-| 5 | Check key existence | `?` operator | WHERE / CASE | ⭐⭐⭐⭐ High |
-| 6 | Deep path access | `#>` / `#>>` | SELECT/WHERE | ⭐⭐⭐ Medium |
-| 7 | Check containment | `@>` | WHERE | ⭐⭐⭐ Medium |
-| 8 | Aggregate rows to JSON array | `jsonb_agg()` | SELECT | ⭐⭐⭐⭐ High |
-| 9 | Build JSON object inline | `jsonb_build_object()` | SELECT/UPDATE | ⭐⭐⭐⭐ High |
-| 10 | Unnest JSONB array laterally | `jsonb_array_elements()` | FROM/JOIN | ⭐⭐⭐⭐ High |
-| 11 | Measure array length | `jsonb_array_length()` | WHERE/IF | ⭐⭐⭐ Medium |
-| 12 | Build literal JSONB array | `jsonb_build_array()` | UPDATE | ⭐⭐ Low-Med |
-| 13 | Insert JSONB document literal | `'...'::jsonb` | INSERT/UPDATE | ⭐⭐⭐⭐⭐ Very High |
-| 14 | Safe null initialize | `COALESCE(col, '{}'::jsonb)` | UPDATE | ⭐⭐⭐ Medium |
-| 15 | Insert full schema row | `INSERT INTO ... VALUES(... ::jsonb)` | INSERT | ⭐⭐⭐⭐ High |
-| 16 | Function returning jsonb table | `RETURNS TABLE(data jsonb)` | FUNCTION | ⭐⭐⭐ Medium |
-| 17 | Trigger reading JSONB | `NEW.col -> 'key' ->> 'field'` | TRIGGER | ⭐⭐ Low-Med |
-| 18 | Conditional CTE + update | `WITH ... AS (...) UPDATE` | CTE+UPDATE | ⭐⭐⭐ Medium |
+- **Does NOT** calculate entitlement amounts (handled by upstream entitlement services)
+- **Does NOT** trigger payout cycle creation or progression
+- **Does NOT** directly write to the GL database — it delegates to the platform's BulkCUD (Bulk Create-Update-Delete) batch pipeline
+- **Does NOT** send notifications or emails
 
----
+### System Context
 
-## Pattern 1 — Field Access Operators (`->` and `->>`)
-
-### Description
-- `->` returns the value as **JSONB** (preserves type)
-- `->>` returns the value as **TEXT** (for comparison/display)
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-21690 / RTB-22853 — reading agent fields in WHERE clause
-WHERE ag.stage->>'stage_id' = 'active'
-AND ag.core_attributes->>'agent_code' IS NOT NULL
-AND et.core_attributes->>'auto_termination_on_license_exp' = 'true'
-AND ag.licencedetail->'core_attributes'->>'license_expiry_date' IS NOT NULL
-AND date(to_timestamp(ag.licencedetail->'core_attributes'->>'license_expiry_date', 'DD/MM/YYYY HH24:MI:SS')) < date(current_timestamp)
 ```
-
-```sql
--- RTB-22637 — accessing nested lookup values
-WHERE (arr0.opt0 -> 'core_attributes') ->> 'mapping_status' = 'Active'
-  AND agent.system_attributes->>'status' = 'Active'
-```
-
-```sql
--- RTB-22951 — trigger function reading system_attributes
-NEW.last_modified_ts := to_timestamp(
-  (NEW.system_attributes->'tablename'->>'last_modified_date')::text,
-  'DD/MM/YYYY HH24:MI:SS'
-);
-NEW.last_modified_aggregate_ts := to_timestamp(
-  (NEW.system_attributes->'tablename'->'aspect'->>'aspect_modified_date')::text,
-  'DD/MM/YYYY HH24:MI:SS'
-);
-```
-
-### Key Rules
-- `->` can be chained: `col->'a'->'b'->'c'`
-- Mix `->` then `->>` at the final level: `col->'nested'->>'text_value'`
-- Use `->>` in comparisons; use `->` when passing to JSONB functions
-
----
-
-## Pattern 2 — `jsonb_set()` for Nested Updates
-
-### Description
-```sql
-jsonb_set(target jsonb, path text[], new_value jsonb, create_missing boolean)
-```
-Modifies a specific key path inside a JSONB column without replacing the entire document.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-21690 — adding a new attribute to object_repository.core_attributes
-UPDATE object_repository or2
-SET core_attributes = jsonb_set(
-    core_attributes,
-    '{subcode_reason_for_termination}',
-    '{"is_pii":false,"datatype":"LOV","label_id":"Sub Code Reason for Termination",
-      "date_only":true,"lov_detail":{"lov":["Same As Parent"],"data_owner":"Client"},
-      "description":"new attribute","is_unique_id":false,"is_filterable":false,
-      "attribute_name":"subcode_reason_for_termination"}'::jsonb,
-    true
-)
-WHERE object_id='entitytype' AND object_mode='Draft';
-```
-
-```sql
--- RTB-21690 — updating nested path in service_interaction.si_input_schema
-UPDATE service_interaction si
-SET si_input_schema = jsonb_set(
-    si_input_schema,
-    '{properties,entitytype,properties,core_attributes,properties,subcode_reason_for_termination}',
-    '{"enum": ["Same As Parent"]}',
-    true
-)
-WHERE si_input_schema::text ILIKE '%"entitytype"%' AND object_id = 'entitytype';
-```
-
-```sql
--- RTB-21690 — appending to an array within a JSONB path
-UPDATE service_interaction si
-SET si_input_schema = jsonb_set(
-    si_input_schema,
-    '{properties,entitytype,properties,core_attributes,order}',
-    COALESCE(si_input_schema#>'{properties,entitytype,properties,core_attributes,order}', '[]'::jsonb)
-      || '["subcode_reason_for_termination"]'::jsonb,
-    true
-)
-WHERE si_input_schema::text ILIKE '%"entitytype"%' AND object_id = 'entitytype'
-AND NOT (COALESCE(
-    si.si_input_schema->'properties'->'entitytype'->'properties'->'core_attributes'->'order',
-    '[]'::jsonb
-) @> '["subcode_reason_for_termination"]'::jsonb);
-```
-
-```sql
--- RTB-22699 — building entire nested object with jsonb_build_object inside jsonb_set
-UPDATE service_registry
-SET processor_schema = jsonb_set(
-    processor_schema,
-    '{postprocessor}',
-    jsonb_build_object(
-        'type', 'sns',
-        'payload', jsonb_build_object('keys', jsonb_build_array(primary_object)),
-        'configuration', jsonb_build_object(
-            'topic', jsonb_build_array('{{audit-log-topic}}', '{{object-cud-status-chain-topic}}')
-        )
-    ),
-    true
-)
-WHERE service_repository_id ILIKE '%update%internal%' OR service_repository_id ILIKE '%bulkupload';
-```
-
-```sql
--- RTB-22716 — moving data from one JSONB field to another
-UPDATE agent
-SET
-    core_attributes = jsonb_set(
-        core_attributes,
-        '{ifsc_code}',
-        bankdetail -> 'core_attributes' -> 'ifsc_code',
-        true
-    ),
-    additional_attributes = jsonb_set(
-        additional_attributes,
-        '{rtb_lookup_data,ifsc_code}',
-        bankdetail -> 'additional_attributes' -> 'rtb_lookup_data' -> 'ifsc_code',
-        true
-    )
-WHERE bankdetail -> 'core_attributes' -> 'ifsc_code' IS NOT NULL;
-```
-
-### Key Rules
-- Path is always `'{key1,key2,...}'` — a text array literal
-- `create_missing = true` creates the key if absent; `false` does nothing if key doesn't exist
-- Can be nested: `jsonb_set(jsonb_set(...), ...)` for multiple paths (or use `||`)
-- Value argument must be JSONB — use `'...'::jsonb` for literals
-
----
-
-## Pattern 3 — `||` Concatenation / Merge Operator
-
-### Description
-Merges two JSONB objects. Overlapping keys are **overwritten by the right operand**.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22480 — conditionally adding an attribute if not present
-UPDATE object_repository
-SET core_attributes = COALESCE(core_attributes, '{}'::jsonb)
-    || '{"termination_letter":{"attribute_name":"termination_letter","datatype":"Boolean",
-         "date_only":true,"description":"termination_letter","is_filterable":false,
-         "is_pii":false,"is_unique_id":false,"label_id":"Termination Letter"}}'::jsonb
-WHERE object_id = 'entitytype'
-AND NOT (COALESCE(core_attributes, '{}'::jsonb) ? 'termination_letter');
-```
-
-```sql
--- RTB-22480 — appending to a sequence array inside document_attributes
-UPDATE object_repository
-SET document_attributes = jsonb_set(
-    COALESCE(document_attributes, '{}'::jsonb)
-      || '{"termination_letter":{...}}'::jsonb,
-    '{sequence}',
-    COALESCE(document_attributes->'sequence', '[]'::jsonb) || '["termination_letter"]'::jsonb
-)
-WHERE object_id = 'agentbusinesscode'
-AND NOT (COALESCE(document_attributes, '{}'::jsonb) ? 'termination_letter');
-```
-
-```sql
--- RTB-22027 — casting text JSON field to jsonb and appending
-UPDATE service_registry
-SET allowed_stages = (
-    (allowed_stages::jsonb || '"terminated"'::jsonb)::text
-)
-WHERE NOT (allowed_stages::jsonb ? 'terminated')
-AND service_repository_id = 'deleteagenttermination';
-```
-
-```sql
--- RTB-23679 — appending an item to a JSONB array column
-SET input_domain_objects = input_domain_objects || '["agententitlementfcmgst"]'::jsonb
-```
-
-### Key Rules
-- `{} || {...}` = merge objects (right wins on conflict)
-- `[] || [...]` = concat arrays
-- `[] || '"item"'::jsonb` = append single item to array
-- The `||` result type is `jsonb` — cast back to text if column is stored as `text`
-
----
-
-## Pattern 4 — `?` Key Existence Check
-
-### Description
-Checks whether a JSONB object **contains a given key** (top-level only).
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22480 — guard before adding a key
-WHERE NOT (COALESCE(core_attributes, '{}'::jsonb) ? 'termination_letter');
-```
-
-```sql
--- RTB-22384 — conditional in CASE expression
-CASE
-    WHEN statuses -> 'onboarding' ? 'formsgenerate1a1bannexure' THEN statuses
-    ELSE jsonb_set(statuses, '{onboarding, formsgenerate1a1bannexure}', '...'::jsonb, true)
-END
-```
-
-```sql
--- RTB-22668 — check at nested path
-WHEN si_input_schema #> '{properties,agent,properties,agentbankdetail,properties,core_attributes,properties}'
-     ? 'bank_branch_name'
-THEN 'already_exists'
-```
-
-```sql
--- RTB-22027 — check array item existence in text-stored JSON
-WHERE NOT (allowed_stages::jsonb ? 'terminated')
-```
-
-### Key Rules
-- `col ? 'key'` → checks only the immediate top-level keys
-- For nested: first navigate with `#>`, then apply `?`
-- `?|` = any of keys exist; `?&` = all of keys exist (less common but available)
-
----
-
-## Pattern 5 — `#>` and `#>>` Path Operators
-
-### Description
-Navigate deep JSONB paths using an **array of key names**.
-- `#>` returns JSONB
-- `#>>` returns text
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22668 — deep path access in WHERE
-WHERE si_input_schema #> '{properties,agent,properties,agentbankdetail,properties,core_attributes,properties}'
-      ? 'bank_branch_name'
-```
-
-```sql
--- RTB-21690 — COALESCE with a path to avoid null on array append
-COALESCE(si_input_schema #> '{properties,entitytype,properties,core_attributes,order}', '[]'::jsonb)
-  || '["subcode_reason_for_termination"]'::jsonb
-```
-
-```sql
--- RTB-23679 — access to deeply nested last_modified path in function body
-to_timestamp(
-  jsonb_array_elements(a.withholdtaxexemption) -> 'core_attributes' ->> 'certificate_applicable_date',
-  'DD/MM/YYYY HH24:MI:SS'
-)
-```
-
-### Key Rules
-- `col #> '{a,b,c}'` ≡ `col->'a'->'b'->'c'` but more readable for deep paths
-- Used especially when the path is dynamic or very long
-- Combine with `?` for conditionally present nested keys
-
----
-
-## Pattern 6 — `@>` Containment Operator
-
-### Description
-Tests whether a JSONB value **contains** another JSONB value (subset check for objects or arrays).
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-21690 — check if an array already contains a specific string item
-AND NOT (
-    COALESCE(
-        si.si_input_schema->'properties'->'entitytype'->'properties'->'core_attributes'->'order',
-        '[]'::jsonb
-    ) @> '["subcode_reason_for_termination"]'::jsonb
-)
-```
-
-```sql
--- RTB-22384 — check if sequence array already contains "forms" string
-WHEN NOT (document_attributes -> 'sequence' @> '"forms"')
-THEN jsonb_set(document_attributes, '{sequence}', (document_attributes->'sequence') || '"forms"'::jsonb, true)
-```
-
-### Key Rules
-- `'["a","b","c"]'::jsonb @> '["b"]'::jsonb` → `true`
-- `'{"x":1,"y":2}'::jsonb @> '{"x":1}'::jsonb` → `true`
-- The operands must be the same JSONB type (both arrays or both objects)
-- Commonly used with `NOT @>` to avoid duplicate inserts into arrays
-
----
-
-## Pattern 7 — `jsonb_agg()` Aggregation
-
-### Description
-Aggregates multiple rows into a single JSONB array.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22637 — aggregating agent codes as a JSONB array
-agentCodes := (
-    SELECT jsonb_agg(core_attributes->>'agent_code')
-    FROM agent
-    WHERE last_modified_ts > last_requested_date_times
-       OR last_modified_aggregate_ts > last_requested_date_times
-);
-```
-
-```sql
--- RTB-22637 — return result as jsonb from function
-RETURN QUERY SELECT jsonb_agg(jsonb_build_object('agentmaster_id', agentmaster_id))
-FROM agent
-WHERE last_modified_ts > last_requested_date_times
-   OR last_modified_aggregate_ts > last_requested_date_times;
-```
-
-```sql
--- RTB-23679 — aggregating full objects with COALESCE null-safe default
-SELECT jsonb_build_object(
-    'parenttxn_variables',
-    COALESCE(
-        (SELECT jsonb_agg(jsonb_build_object(
-            'parent_txn_id', parent_txn_id,
-            'agent_code', agent_code,
-            'CGST', cgst,
-            'Total_GST', total_gst
-        )) FROM grouped_parenttxn),
-        '[]'::jsonb
-    )
-) AS result_json;
-```
-
-### Key Rules
-- Returns `NULL` if no rows exist — use `COALESCE(..., '[]'::jsonb)` for empty array
-- Combine with `jsonb_build_object()` to aggregate complex objects
-- Can be assigned to a `JSONB` variable in PL/pgSQL
-
----
-
-## Pattern 8 — `jsonb_build_object()` Construction
-
-### Description
-Builds a JSONB object from alternating key-value pairs.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22699 — building nested postprocessor config
-jsonb_build_object(
-    'type', 'sns',
-    'payload', jsonb_build_object(
-        'keys', jsonb_build_array(primary_object)
-    ),
-    'configuration', jsonb_build_object(
-        'topic', jsonb_build_array(
-            '{{audit-log-topic}}',
-            '{{object-cud-status-chain-topic}}'
-        )
-    )
-)
-```
-
-```sql
--- RTB-23679 — building result in a SELECT
-SELECT jsonb_build_object(
-    'parenttxn_variables',   COALESCE((SELECT jsonb_agg(...) FROM grouped_parenttxn), '[]'::jsonb),
-    'parenttxnhold_variables', COALESCE((SELECT jsonb_agg(...) FROM grouped_hold), '[]'::jsonb),
-    'parenttxnrelease_variables', COALESCE((SELECT jsonb_agg(...) FROM grouped_release), '[]'::jsonb)
-) AS result_json;
-```
-
-```sql
--- RTB-22637 — building return value
-RETURN jsonb_build_object('error', 'Payout cycle not found');
-```
-
-### Key Rules
-- Arguments are `key, value, key, value, ...` (must be even count)
-- Keys are always text; values are any SQL type (auto-converted to JSONB)
-- Nest calls for deeply structured output
-- Combine with `jsonb_agg()` for array values
-
----
-
-## Pattern 9 — `jsonb_array_elements()` Lateral Unnesting
-
-### Description
-Expands a JSONB array into a set of rows — each element becomes one row.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-21690, RTB-22637 — lateral join to unnest supervisormap
-FROM agent ag
-LEFT JOIN LATERAL jsonb_array_elements(ag.supervisormap) AS json_data ON true
-WHERE (json_data->'core_attributes'->>'mapping_status') = 'Active'
-```
-
-```sql
--- RTB-22637 — unnest with ORDINALITY to get index
-LEFT JOIN LATERAL jsonb_array_elements(a.supervisormap) WITH ORDINALITY arr0(opt0, ord0)
-    ON (arr0.opt0 -> 'core_attributes') ->> 'mapping_status' = 'Active'
-```
-
-```sql
--- RTB-23679 — unnest with element filtering
-FROM jsonb_array_elements(b.adjustmentdetail) AS element
-WHERE element->>'status' = 'Active'
-```
-
-```sql
--- RTB-23679 — unnest and sort inside subquery
-SELECT jsonb_array_elements(a.withholdtaxexemption)
-ORDER BY to_timestamp(
-    jsonb_array_elements(a.withholdtaxexemption)->'core_attributes'->>'certificate_applicable_date',
-    'DD/MM/YYYY HH24:MI:SS'
-) DESC
-```
-
-### Key Rules
-- Must be in a `FROM` or `JOIN LATERAL` clause
-- Each row produced has the element as a `jsonb` column
-- Use `WITH ORDINALITY` to get a sequential index alongside
-- Use `AS alias(colname, ord)` to name the columns
-- `CROSS JOIN jsonb_array_elements(col)` expands every array element × every row
-
----
-
-## Pattern 10 — `jsonb_array_length()`
-
-### Description
-Returns the number of elements in a JSONB array.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22637 — guard conditional before expensive insert
-IF jsonb_array_length(agentCodes) > 0 THEN
-    -- ...expensive insert...
-END IF;
-```
-
-```sql
--- RTB-23679 — conditional in SELECT CASE
-CASE
-    WHEN jsonb_array_length(a.withholdtaxexemption) > 0 THEN 1
-    ELSE 0
-END AS has_exempt_certs
-```
-
-### Key Rules
-- Returns `0` for empty `[]`, error for non-array values
-- Always check that the JSONB value is actually an array before calling
-
----
-
-## Pattern 11 — `jsonb_build_array()`
-
-### Description
-Constructs a JSONB array from a list of values.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22699 — build an array of topic names
-jsonb_build_array(
-    '{{audit-log-topic}}',
-    '{{object-cud-status-chain-topic}}'
-)
-```
-
-```sql
--- RTB-22699 — build array from a column value
-jsonb_build_array(primary_object)
-```
-
-### Key Rules
-- Takes any number of arguments (values are auto-typed)
-- Equivalent to `'["a","b"]'::jsonb` for static arrays, but dynamic
-
----
-
-## Pattern 12 — `::jsonb` Cast Literals in INSERT/UPDATE
-
-### Description
-Casting a string literal containing JSON to the `jsonb` type. Used heavily to insert structured schema documents.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22286 / RTB-22027 — INSERT with large schema body
-INSERT INTO service_interaction
-    (si_id, si_version, si_name, si_status, si_source,
-     service_repository_id, object_id, si_input_schema, si_output_schema,
-     si_type, applicable_role, applicable_stage_status, audit)
-VALUES(8000, 1, 'addressupdateinternal', 'active', 'standard',
-       'updateagentbulkupload', 'agent',
-       '{"type":"object","required":["agent"],"properties":{...}}'::jsonb,
-       '[{"spec":{"agent":"&"},"operation":"shift"}]'::jsonb,
-       'default', NULL, NULL, NULL);
-```
-
-```sql
--- RTB-22480 — literal patch value in UPDATE
-SET core_attributes = COALESCE(core_attributes, '{}'::jsonb)
-    || '{"termination_letter":{...}}'::jsonb
-```
-
-```sql
--- Empty JSONB values
-'{}'::jsonb     -- empty object
-'[]'::jsonb     -- empty array
-'null'::jsonb   -- JSON null
-```
-
-### Key Rules
-- Always validate JSON is well-formed before casting — runtime error on bad JSON
-- Very large schema literals are common in `service_interaction.si_input_schema`
-- `'[]'::jsonb` is the safe empty array default
-- `'{}'::jsonb` is the safe empty object default
-
----
-
-## Pattern 13 — `COALESCE(column, '{}'::jsonb)`
-
-### Description
-Guards against NULL JSONB columns before performing merge or `?` checks.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22480 — safe merge even when column is NULL
-SET core_attributes = COALESCE(core_attributes, '{}'::jsonb)
-    || '{"new_key":{...}}'::jsonb
-WHERE NOT (COALESCE(core_attributes, '{}'::jsonb) ? 'new_key');
-```
-
-```sql
--- RTB-22668 — safe path init
-jsonb_set(
-    COALESCE(document_attributes, '{}'::jsonb) || '{"termination_letter":{...}}'::jsonb,
-    '{sequence}',
-    COALESCE(document_attributes->'sequence', '[]'::jsonb) || '["termination_letter"]'::jsonb
-)
-```
-
-### Key Rules
-- `NULL || '{}'::jsonb` returns `NULL` — always COALESCE first
-- `NULL ? 'key'` returns `NULL` — guard before existence checks too
-- Standard idiom: `COALESCE(col, '{}'::jsonb) || '{"k":"v"}'::jsonb`
-
----
-
-## Pattern 14 — `INSERT INTO` with Embedded JSONB Schema
-
-### Description
-Full-row INSERTs into configuration tables where columns hold complete JSON Schema documents.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22027 — inserting a full service_interaction row
-INSERT INTO service_interaction
-    (si_id, si_version, si_name, si_status, si_source,
-     service_repository_id, object_id, si_input_schema, si_output_schema,
-     si_type, applicable_role, applicable_stage_status, audit)
-VALUES(
-    6602, 1, 'deletetermination', 'active', 'standard',
-    'deleteagenttermination', 'agenttermination',
-    '{"type": "object", "required": ["agenttermination"], "properties": {
-        "agenttermination": {"type": "object", "required": [], "properties": {
-            "root_id": {"type": "number"},
-            "core_attributes": {"type": "object", "order": [...], "required": [], "properties": {
-                "remarks": {"type": "string"},
-                "termination_date": {"type": "string", "pattern": "^...$"},
-                ...
-            }}
-        }}
-    }}'::jsonb,
-    '[{"spec": {"agent": "&", "agenttermination": "&"}, "operation": "shift"}]'::jsonb,
-    'default', NULL, NULL, NULL
-);
-```
-
-```sql
--- RTB-23679 — inserting object_repository entry with multiple JSONB columns
-INSERT INTO object_repository VALUES(
-    'agententitlementfcmgst', 'FCMGST', 'Cycle Invoice', 'DAO', 'FCMGST',
-    false, NULL, NULL,
-    '{...core_attributes schema...}'::jsonb,
-    'agententitlement', NULL,
-    '{}'::jsonb,
-    '{...statuses/workflow JSON...}'::jsonb,
-    'Draft', 'Multiple', 15776, NULL, NULL, 'agententitlement',
-    NULL, NULL,
-    '{...document_attributes...}'::jsonb,
-    NULL, NULL, NULL, false, NULL, false, false,
-    '[]'::jsonb
-);
-```
-
-### Key Rules
-- Multiple JSONB columns per row are common — each gets `'...'::jsonb`
-- The JSON Schema structure (`type`, `properties`, `required`, `pattern`) is standardized
-- Large INSERTs are hard to read — validate JSON externally before pasting
-
----
-
-## Pattern 15 — `RETURNS TABLE(data jsonb)` in PL/pgSQL Functions
-
-### Description
-PostgreSQL functions that return a result as a table of JSONB rows, enabling the caller to process structured results.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22637
-CREATE OR REPLACE FUNCTION refresh_agent_staging()
-RETURNS TABLE(data jsonb)
-LANGUAGE plpgsql
-AS $function$
-DECLARE
-    agentCodes jsonb;
-    ...
-BEGIN
-    agentCodes := (
-        SELECT jsonb_agg(core_attributes->>'agent_code')
-        FROM agent
-        WHERE last_modified_ts > last_requested_date_times
-    );
-    IF jsonb_array_length(agentCodes) > 0 THEN
-        -- ... do INSERT ...
-    END IF;
-    RETURN QUERY SELECT jsonb_agg(jsonb_build_object('agentmaster_id', agentmaster_id))
-    FROM agent
-    WHERE last_modified_ts > last_requested_date_times;
-END;
-$function$;
-```
-
-```sql
--- RTB-23679 — function with multiple JSONB variables
-CREATE OR REPLACE FUNCTION calculate_payout(p_payoutcycle_id TEXT)
-RETURNS jsonb
-LANGUAGE plpgsql
-AS $function$
-DECLARE
-    v_agent_missing JSONB;
-    v_entitlement_missing JSONB;
-    v_tax_config JSONB;
-    v_core_attributes JSONB;
-BEGIN
-    IF NOT FOUND THEN
-        RETURN jsonb_build_object('error', 'Payout cycle not found');
-    END IF;
-    SELECT COALESCE(jsonb_agg(a.core_attributes->>'agent_code'), '[]'::jsonb)
-    INTO v_entitlement_missing FROM ...;
-    IF jsonb_array_length(v_entitlement_missing) > 0 THEN
-        RETURN jsonb_build_object('reference_object_missing_entitlement', v_entitlement_missing);
-    END IF;
-    ...
-END;
-$function$;
-```
-
-### Key Rules
-- Use `RETURN QUERY SELECT ...` to stream rows from functions
-- Use `RETURNS jsonb` for single-value functions; `RETURNS TABLE(data jsonb)` for multi-row
-- `JSONB` variables are declared in `DECLARE` block and assigned with `:=`
-
----
-
-## Pattern 16 — Trigger Functions Using JSONB Navigation
-
-### Description
-`BEFORE INSERT OR UPDATE` triggers that read JSONB columns from `NEW.*` to populate computed columns.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22951 — trigger function to sync last_modified timestamps
-CREATE OR REPLACE FUNCTION tablename_update_last_modified_ts()
-RETURNS trigger AS $$
-BEGIN
-    NEW.last_modified_ts := to_timestamp(
-        (NEW.system_attributes->'tablename'->>'last_modified_date')::text,
-        'DD/MM/YYYY HH24:MI:SS'
-    );
-    NEW.last_modified_aggregate_ts := to_timestamp(
-        (NEW.system_attributes->'tablename'->'aspect'->>'aspect_modified_date')::text,
-        'DD/MM/YYYY HH24:MI:SS'
-    );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER tablename_trg_update_last_modified_ts
-BEFORE INSERT OR UPDATE ON tablename
-FOR EACH ROW
-EXECUTE FUNCTION tablename_update_last_modified_ts();
-```
-
-### Key Rules
-- `NEW.col` accesses the incoming row's JSONB value
-- Result is written back to `NEW.computed_col` for derived columns
-- Trigger must `RETURN NEW` after modification
-
----
-
-## Pattern 17 — CTE with Conditional JSONB Updates
-
-### Description
-Uses a Common Table Expression (CTE) to evaluate conditions on JSONB fields, then applies the update.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22668 — safe idempotent update using CTE
-WITH check_and_update AS (
-    SELECT
-        si_id, si_version,
-        CASE
-            WHEN si_input_schema #> '{properties,agent,properties,agentbankdetail,properties,core_attributes,properties}'
-                 ? 'bank_branch_name'
-            THEN 'already_exists'
-            ELSE 'newly_added'
-        END AS status,
-        CASE
-            WHEN si_input_schema #> '{properties,agent,properties,agentbankdetail,properties,core_attributes,properties}'
-                 ? 'bank_branch_name'
-            THEN si_input_schema
-            ELSE jsonb_set(
-                si_input_schema,
-                '{properties,agent,properties,agentbankdetail,properties,core_attributes,properties,bank_branch_name}',
-                '{"type": "string"}'::jsonb,
-                true
-            )
-        END AS updated_schema
-    FROM service_interaction
-    WHERE si_id = '5000' AND si_version = '12'
-)
-UPDATE service_interaction si
-SET si_input_schema = c.updated_schema
-FROM check_and_update c
-WHERE si.si_id = c.si_id AND si.si_version = c.si_version
-RETURNING si.si_id, c.status AS action_taken;
-```
-
-### Key Rules
-- CTEs make the logic readable and auditable
-- `RETURNING` clause confirms what changed
-- The status field (`already_exists` / `newly_added`) is used for deployment audit
-
----
-
-## Pattern 18 — `jsonb_set` Inside `document_attributes` and `statuses` Arrays
-
-### Description
-Combines `||` merge and `jsonb_set` to update both object keys and embedded arrays atomically.
-
-### Real Examples from Changelogs
-
-```sql
--- RTB-22384 — complex double update: statuses + document_attributes in one UPDATE
-UPDATE object_repository
-SET
-    statuses = CASE
-        WHEN statuses -> 'onboarding' ? 'formsgenerate1a1bannexure'
-        THEN statuses
-        ELSE jsonb_set(
-            statuses,
-            '{onboarding, formsgenerate1a1bannexure}',
-            '{"final":false,"initial":false,"publish":true,"label_id":"Forms Generate 1A & 1B & Annexure",
-              "status_id":"formsgenerate1a1bannexure","status_name":"formsgenerate1a1bannexure",
-              "final_status_objects":[],"mandatory_attributes":[]}'::jsonb,
-            true
-        )
-    END,
-    document_attributes = jsonb_set(
-        CASE
-            WHEN NOT (document_attributes ? 'sequence') THEN
-                jsonb_set(document_attributes, '{sequence}', '["forms"]'::jsonb, true)
-            WHEN NOT (document_attributes -> 'sequence' @> '"forms"') THEN
-                jsonb_set(document_attributes, '{sequence}',
-                    (document_attributes -> 'sequence') || '"forms"'::jsonb, true)
-            ELSE document_attributes
-        END,
-        '{forms}',
-        '{"datatype":"Document","label_id":"Form 1-A & 1-B & Annexure -1",
-          "attribute_name":"forms","document_master_id":"Forms","document_category_id":"statement"}'::jsonb,
-        true
-    )
-WHERE object_id = 'agentindividualdetails' AND statuses ? 'onboarding';
+Payout Cycle Trigger
+       |
+       v
+ [Accounting Trigger Action Service]
+       |  POST /accounting-ledger-service/<payout_cycle_id>/<gl_acc_rule_id>
+       v
+ [accounting-ledger-service]  <-- THIS SERVICE
+       |
+       |-- Reads payout cycle & entitlement data (BulkRead API / S3)
+       |-- Looks up GL rule master & GL mapping tables (GLCache)
+       |-- Generates balanced CR + DR CSV rows
+       |
+       v
+ [Platform Batch/BulkCUD API]
+       |
+       v
+ [accountingledger Object in Platform DB]
 ```
 
 ---
 
-## Catalogue of Tables Targeted
+## 2. Project Structure & Module Responsibilities
 
-| Table | JSONB Columns Updated |
-|-------|-----------------------|
-| `agent` | `core_attributes`, `additional_attributes`, `system_attributes`, `supervisormap`, `bankdetail`, `licencedetail`, `termination`, `stage` |
-| `object_repository` | `core_attributes`, `statuses`, `document_attributes` |
-| `service_interaction` | `si_input_schema`, `si_output_schema` |
-| `service_registry` | `processor_schema`, `allowed_stages` (text→jsonb cast) |
-| `parenttxn` / `childtxn` | `peoplecreditmap`, `creditmap`, `txnlifecycleeventhistory` |
-| `entitytype` | `core_attributes` |
-| `agententitlement` | `core_attributes`, `stage_status`, `system_attributes`, `reference_object` |
+```
+accounting-ledger-service-develop/
+├── accounting_ledger_service/          # Main application package
+│   ├── controller.py                   # Flask entry point & HTTP route
+│   ├── service_handler.py              # Top-level orchestration / handler
+│   ├── FactoryPattern.py               # Factory: selects correct ledger impl
+│   ├── account.py                      # Abstract base class AccountLedger + AgentLevelAccountLedger
+│   ├── GLCache.py                      # In-memory cache for GL master data
+│   ├── Util.py                         # BulkRead API helper, payout cycle fetcher
+│   ├── custom_code.py                  # Specialised data-to-file transformers
+│   └── impl/                           # Concrete ledger implementations
+│       ├── Accrual.py                  # AgentPayble, WithholdTax, LocalTax, GST
+│       ├── Provisional.py              # ProvisionalBase, ParentTxn, ChildTxn, AgentTxn
+│       ├── Settlement.py               # BankPayble (COMMPAY)
+│       ├── Adjustment.py               # TaxableAdjustment, NonTaxableAdjustment
+│       ├── BulkBatchAction.py          # Batch creation & bulk upload orchestration
+│       └── __init__.py
+├── Tests/                              # Unit tests
+│   ├── test_Accrual.py
+│   ├── test_Adjustment.py
+│   ├── test_Provisional.py
+│   ├── test_Settlement.py
+│   └── test_Util.py
+├── test/                               # Integration / manual test fixtures
+│   ├── event*.json                     # Sample event payloads per GL rule
+│   └── test.py
+├── Dockerfile
+├── run.sh                              # Docker run script (used by CI/CD)
+├── build.sh
+├── requirements.txt
+├── pip.conf                            # Internal PyPI mirror config
+└── changelog.md
+```
+
+### Architectural Pattern
+
+The service follows a **Layered + Strategy/Factory** architecture:
+
+```
+HTTP Layer          → controller.py  (Flask route)
+Orchestration Layer → service_handler.py  (event wiring)
+Domain Layer        → account.py  (abstract base, common pipeline)
+Strategy Layer      → impl/*.py  (concrete GL rule implementations)
+Infrastructure Layer→ GLCache.py, Util.py, BulkBatchAction.py  (external calls)
+```
+
+The Factory Pattern (`FactoryPattern.py`) selects the correct concrete class at runtime based on the `gl_acc_rule_id` passed in the request. All concrete classes share a common processing pipeline defined in `AccountLedger.createAccountingUploadFile()`.
 
 ---
 
-## Learning Guide — What to Study
+## 3. High-Level Architecture
 
-### Level 1 — Fundamentals (Start Here)
+### Entry Point
 
-| Topic | What to Learn |
-|-------|---------------|
-| JSONB vs JSON | Differences in storage, indexing, and operators |
-| `->` vs `->>` | When each is appropriate; chaining |
-| `::jsonb` cast | How PostgreSQL parses JSON string literals |
-| `'{}'::jsonb` defaults | Safe initialization pattern |
-| Basic `SELECT` with JSONB | `WHERE col->>'key' = 'value'` queries |
+One REST endpoint accepts all requests:
 
-**Practice Table:**
-```sql
-CREATE TABLE test_jsonb (id SERIAL, data JSONB);
-INSERT INTO test_jsonb(data) VALUES
-  ('{"name":"Alice","age":30,"address":{"city":"Mumbai","pincode":"400001"}}'),
-  ('{"name":"Bob","age":25,"address":{"city":"Delhi","pincode":"110001"}}');
+```
+POST /accounting-ledger-service/<payout_cycle_id>/<gl_acc_rule_id>
 ```
 
-**Practice Queries:**
-```sql
-SELECT data->>'name', data->'address'->>'city' FROM test_jsonb;
-SELECT * FROM test_jsonb WHERE data->>'name' = 'Alice';
-SELECT * FROM test_jsonb WHERE data->'address'->>'city' = 'Mumbai';
+**Required HTTP Headers:**
+
+| Header | Description |
+|---|---|
+| `client` | Client/tenant identifier (e.g., `kli`, `ifl`) |
+| `domain` | Domain identifier (e.g., `incentihub`) |
+| `stage_id` | Lifecycle stage (e.g., `provisional`, `accrual`, `settlement`) |
+| `stage` | Deployment environment tag (e.g., `CLIENT_SB`, `QA`) |
+
+### External Dependencies
+
+| Dependency | Usage |
+|---|---|
+| **BulkRead API** | Paginated reads for entitlement, GL rule master, GL maps |
+| **Platform Batch API** | Creates batch, adds parallel task, triggers processing |
+| **AWS S3** | Downloads provisional calculation report CSV files |
+| **AWS DynamoDB** | Runtime properties store (via `property-fetcher` library) |
+| **Platform Object API** | Reads payout cycle data (single object GET) |
+| **`accountingledger` read** | Checks for existing ledger records during deduplication |
+
+### Data Flow Diagram
+
 ```
-
----
-
-### Level 2 — UPDATE Patterns (Core Skills)
-
-| Topic | What to Learn |
-|-------|---------------|
-| `jsonb_set()` | Path syntax, `create_missing` flag |
-| `\|\|` operator | Object merge vs array concatenation |
-| `?` operator | Key existence, `?|`, `?&` |
-| `NOT (col ? 'key')` | Idempotent add-if-missing |
-| `COALESCE(col, '{}'::jsonb)` | NULL safety |
-
-**Practice Queries:**
-```sql
--- Add a field
-UPDATE test_jsonb SET data = jsonb_set(data, '{email}', '"alice@example.com"', true)
-WHERE data->>'name' = 'Alice';
-
--- Merge
-UPDATE test_jsonb SET data = data || '{"phone":"9999999999"}'::jsonb
-WHERE NOT (data ? 'phone');
-
--- Nested update
-UPDATE test_jsonb SET data = jsonb_set(data, '{address,state}', '"Maharashtra"', true);
-```
-
----
-
-### Level 3 — Aggregation and Construction
-
-| Topic | What to Learn |
-|-------|---------------|
-| `jsonb_agg()` | Aggregate rows to array |
-| `jsonb_build_object()` | Construct objects inline |
-| `jsonb_array_elements()` | Unnest arrays into rows |
-| `jsonb_array_length()` | Count array elements |
-| `LATERAL` joins with JSONB | Join each row's array |
-
-**Practice Queries:**
-```sql
--- Aggregate all names as JSONB array
-SELECT jsonb_agg(data->>'name') FROM test_jsonb;
-
--- Build object per row
-SELECT jsonb_build_object('id', id, 'city', data->'address'->>'city') FROM test_jsonb;
-
--- Unnest supervisormap-like array
-SELECT id, elem->>'key' FROM test_jsonb, jsonb_array_elements(data->'tags') elem;
-```
-
----
-
-### Level 4 — Advanced Patterns
-
-| Topic | What to Learn |
-|-------|---------------|
-| `#>` / `#>>` | Deep path arrays |
-| `@>` containment | Subset queries |
-| CTE + conditional UPDATE | Idempotent schema migrations |
-| PL/pgSQL with JSONB variables | Functions using `JSONB` declare/assign |
-| Trigger functions | `NEW.col` JSONB manipulation |
-| GIN Indexes | Performance on JSONB columns |
-
-**Practice:**
-```sql
--- Deep path
-SELECT data #>> '{address,city}' FROM test_jsonb;
-
--- Containment
-SELECT * FROM test_jsonb WHERE data @> '{"address": {"city": "Mumbai"}}';
-
--- CTE conditional update
-WITH check_cte AS (
-    SELECT id, CASE WHEN data ? 'phone' THEN data ELSE data || '{"phone":"0000"}'::jsonb END AS new_data
-    FROM test_jsonb
-)
-UPDATE test_jsonb t SET data = c.new_data FROM check_cte c WHERE t.id = c.id;
+HTTP POST
+   |
+   v
+[controller.py]
+   | – extract headers (client, domain, stage_id, stage)
+   | – call service_handler.accounting_handler(event)
+   v
+[service_handler.py]
+   | – load properties from DynamoDB
+   | – fetch payoutcycle via Object Read API
+   | – FactoryPattern.getType() → selects impl class
+   | – AccountLedger.start(event)
+   v
+[AccountLedger.start()]
+   | – getData()      → fetches raw data (BulkRead API or S3)
+   | – createAccountingUploadFile()  → builds CR+DR CSV in chunks
+   | – callBulkCUD()  → uploads via BulkBatchAction
+   v
+[BulkBatchAction]
+   | – createBatch()
+   | – createBatchParallelTask()
+   | – documentcud()  (uploads CSV)
+   | – mock_bulkaction_statusupdate_trigger()
+   v
+[Platform Bulk Processing → accountingledger records created]
 ```
 
 ---
 
-### Recommended Reading Order
+## 4. End-to-End Service Flow
 
-1. [PostgreSQL JSONB Documentation](https://www.postgresql.org/docs/current/functions-json.html)
-2. `jsonb_set` reference — focus on the `path` syntax
-3. GIN index creation: `CREATE INDEX ON table USING gin(jsonb_col);`
-4. `LATERAL` joins — critical for working with JSONB arrays
-5. PL/pgSQL variables of JSONB type
+### Step 1 — Request Reception (`controller.py`)
+
+The Flask route extracts `payout_cycle_id` and `gl_acc_rule_id` from the URL path, plus tenant headers. It assembles an `event` dict and delegates to `service_handler.accounting_handler()`.
+
+### Step 2 — Properties Load (`service_handler.py`)
+
+`property_fetcher.load_properties(event)` reads from AWS DynamoDB using the tenant context. These properties drive all configurable behaviour (URLs, batch parameters, column mappings, etc.).
+
+### Step 3 — Payout Cycle Fetch (`Util.fetch_payoutcycle`)
+
+If `payoutcycle` is not already in the event (it won't be on a normal API call), the service performs a GET to the Platform Object Read API using the `Payoutcycle.ObjectRead.URL` property. The result is stored in `event["payoutcycle"]`.
+
+### Step 4 — Factory Selection (`FactoryPattern.getType`)
+
+`GLCache` is initialised here. It immediately fetches:
+- All `accountingglrulemaster` records (paginated)
+- All `masterglclientglmap` records (paginated)
+
+The factory validates:
+1. `gl_acc_rule_id` is not None
+2. `stage_id` is not None
+3. The rule is `applicable == True` in the GL rule master
+4. The rule's configured `stage` matches the requested `stage_id` (case-insensitive)
+
+If any check fails, an exception is raised immediately.
+
+Based on `gl_acc_rule_id`, the correct concrete class is selected:
+
+| GL Rule IDs | Class | Stage |
+|---|---|---|
+| `PRVNCTXN`, `PRVNCTXNREC` | `ChildTxn` | provisional |
+| `PRVNPTXN`, `PRVNPTXNREC` | `ParentTxn` | provisional |
+| `PRVNAGT`, `PRVNAGTREC` | `AgentTxn` | provisional |
+| `COMMACCRUEAGT`, `COMMACCRUEAGTREC` | `AgentPayble` | accrual |
+| `COMMACCRUEWITHOLD`, `COMMACCRUEWITHOLDREC` | `WithholdTax` | accrual |
+| `COMMACCRUELT`, `COMMACCRUELTREC` | `LocalTax` | accrual |
+| `COMMACCRUEVATRCM`, `COMMACCRUEVATRCMREC` | `GST` (RCM) | accrual |
+| `COMMACCRUEVATFCM`, `COMMACCRUEVATFCMREC` | `GST` (FCM) | accrual |
+| `TaxableCommExtra`, `TaxableCommLess` | `TaxableAdjustment` | accrual |
+| `NonTaxableCommExtra`, `NonTaxableCommLess` | `NonTaxableAdjustment` | accrual |
+| `COMMPAY`, `COMMPAYREJ`, `COMMPAYREJ1` | `BankPayble` | settlement |
+
+**Reversal flag**: `isReversalEntry` is set to `True` when the rule ID ends with `REC`, `Less`, `REJ`, or `REJ1`. This inverts the amount condition operator from `>` to `<` and flips DR/CR logic in some implementations.
+
+### Step 5 — Data Acquisition (`getData`)
+
+Two strategies exist depending on the class hierarchy:
+
+**A. `AgentLevelAccountLedger.getData()` (Accrual, Settlement, Adjustment)**  
+Calls `getBulkReadAPI()` with a paginated POST to fetch `agententitlement` or `agentpaymentledgertxn` records. Each page is written to a temp CSV file via a callback (`agentLevelDataToFile`).
+
+**B. `ProvisionalBase.getData()` (Provisional)**  
+Downloads a pre-computed calculation report CSV from **AWS S3**. The S3 path comes from `payoutcycle.cyclereview.document_attributes` (either `parent_calculation_report` or `transaction_calculation_report`). File is saved locally under `/tmp/payoutcycle/<cycleid>/`.
+
+### Step 6 — CSV Construction (`createAccountingUploadFile`)
+
+Processes the raw data file in configurable chunks (`FILE_READ_CHUNK_SIZE`, default 10,000 rows):
+
+1. **`chunkPreprocessingHook`** — optional per-implementation filtering/transformations
+2. **Column renaming** — driven by `<task_id>.column_convert` property
+3. **Set common fields** — `compensation_header`, `compensation_entity`, `payout_cycle_id`, `stage`, `gl_acc_rule_id`, `dr_or_cr=CR`, `incenti_txn_code`, `incenti_gl_code`, `accounting_level`
+4. **`populateRuleSpecificData` (CR side)** — looks up `client_gl_code` from GLCache
+5. **`populateAmtAndDate`** — sets `amount` and `accounting_date` fields
+6. **Drop rows with null `accounting_date`** — silently skipped, logged
+7. **Drop rows with `amount == 0`** — only positive amounts flow through
+8. **Round amounts** to `RoundOFF_DIGITS` decimals (default 2)
+9. **`RemoveDuplicates`** — if enabled in `remove_duplicate_applicable_list`, fetches existing CR records and removes matching ones from the new batch (Counter-based matching, not keyed by ID)
+10. **Create DR copy** — `df_dr = filtered_df_cr.copy()` then `dr_or_cr = DR`, GL code flipped to debit GL
+11. **`chunkPreprocessingHookDR`** — optional DR-side transformations
+12. **`populateRuleSpecificData` (DR side)**
+13. **Column filtering** — keeps only columns listed in `<task_id>.column_to_keep` property
+14. Write CR rows then DR rows to the output CSV (append mode after first chunk)
+
+### Step 7 — Bulk Upload (`callBulkCUD` → `BulkBatchAction`)
+
+1. **`createBatch`** — POST to platform batch API. If batch already exists (422 + "already exists"), treated as success.
+2. **`createBatchParallelTask`** — PUT to add a parallel task to the batch (identified by `task_id`)
+3. **`documentcud`** — multipart POST to upload the CSV file; the CSV is sent as `file=1.csv`
+4. **Sleep** — waits `Wait_Time_Before_Upload_Trigger` seconds (default 30s) before triggering
+5. **`create_mock_statusupdate_payload`** — fetches batch state from Object Read API and constructs the trigger payload
+6. **`mock_bulkaction_statusupdate_trigger`** — POSTs to `DocumentBatchProcessing.URL` to start asynchronous bulk processing
+
+### Key Branching Points
+
+| Decision | Logic |
+|---|---|
+| Provisional vs Accrual/Settlement data source | Class hierarchy — `ProvisionalBase` uses S3, `AgentLevelAccountLedger` uses BulkRead |
+| Reversal entry | `isReversalEntry` flag set from rule ID suffix; flips amount operator and GL code |
+| GST type (RCM vs FCM) | `setGSTType()` sets `gst_type`; different data sources and GL code lookups |
+| Settlement nature_of_payment | Driven by `settlement.<task_id>.add_nature_of_payment_list` property |
+| Accounting date source | `accounting_date_type.mapping` property → `object_id` + `attribute_id` pair |
 
 ---
 
-## Assessment Question Sets
+## 5. Critical Code Walkthrough
 
-### Set A — Beginner (Field Access)
+### `GLCache` — The Performance Cornerstone
 
-**Q1.** Given a table `agent` with a `core_attributes jsonb` column, write a query to return all agents whose `agent_code` is `'A001'`.
+**File**: `accounting_ledger_service/GLCache.py`
 
-<details><summary>Answer</summary>
+Instantiated once per request in `FactoryPattern.getType()`. On construction it eagerly loads:
+- **`accountingglrulemaster`** — all GL rules (keyed by `gl_acc_rule_id`)
+- **`masterglclientglmap`** — all master-to-client GL code mappings (keyed by composite: `incenti_gl_code + compensation_header + compensation_entity + nature_of_payment`)
 
-```sql
-SELECT * FROM agent WHERE core_attributes->>'agent_code' = 'A001';
+Lazy-loaded on demand:
+- **`accounting_lt_gl_map_records`** — LT (local tax) GL maps; loaded by `LocalTax.getPayload()`
+- **`accounting_adjustment_gl_map_records`** — adjustment GL maps; loaded by `TaxableAdjustment.getPayload()`
+- **`accounting_gst_gl_map`** — GST GL maps; loaded by `GST.setGSTType()`
+
+> **⚠️ Important**: GLCache holds **all GL master data in memory** for the lifetime of a single request. There is no cross-request caching. Every API call re-fetches the entire master dataset. This is safe for correctness but can be slow if master tables are large.
+
+### `AccountLedger.RemoveDuplicates` — Idempotency Guard
+
+**File**: `accounting_ledger_service/account.py`, lines 230–318
+
+Enabled only if `task_id` appears in the `remove_duplicate_applicable_list` property.
+
+Algorithm:
+1. Fetches all existing CR ledger records for this `payout_cycle_id` + `gl_acc_rule_id` + `agent_codes` via BulkRead
+2. Builds a `Counter` of existing records keyed by the deduplication columns (configurable via `<task_id>.duplicate_match_key_columns` or `duplicate_match_key_columns_by_gl_acc_rule_id`)
+3. Iterates new records; for each, if a matching existing record count exists, marks the new record for removal and decrements the counter (handles multiple occurrences correctly)
+
+> **Inferred from code**: The deduplication only applies to the **CR side**. DR side is generated as a copy of the CR side after deduplication, so it is implicitly deduplicated.
+
+> **Known gap**: `if "No record found for object_id" in str(e)` — if the BulkRead returns no records (first-time run), this is treated as a valid empty result and the new records pass through unchanged.
+
+### `AccountLedger.createAccountingUploadFile` — Main Pipeline
+
+**File**: `accounting_ledger_service/account.py`, lines 68–215
+
+The most complex method. Key non-obvious behaviours:
+
+- **`is_first_call` flag** controls whether to write the CSV header (first chunk → `to_csv(…)`, subsequent chunks → `to_csv(mode='a', header=False)`)
+- **`amount` is always made absolute** (`abs(row.amount)`) before filtering — this means sign is irrelevant; amounts are passed as absolute values and direction is encoded in `dr_or_cr`
+- **`accounting_txn_id` is in `mandatory_columns` but never populated by this service** — it is expected to be populated by the downstream BulkCUD processing pipeline using the platform's transaction ID generation
+- **`checkIfFIleEmpty`** returns `False` if the file does not exist (all chunks were empty, no records), which causes an exception to be raised
+
+### `BulkBatchAction.mock_bulkaction_statusupdate_trigger` — Trigger Mechanism
+
+**File**: `accounting_ledger_service/impl/BulkBatchAction.py`, lines 82–91
+
+The term "mock" is a misnomer in production context. This method calls the real `DocumentBatchProcessing.URL` endpoint to trigger the actual batch processing. The name originates from early development where this simulated a Lambda/API Gateway callback. **Inferred from code**: In production, this URL points to a real processing trigger endpoint (possibly a Lambda via API Gateway or an NLB endpoint).
+
+### `GST.chunkPreprocessingHook` — CGST/SGST/IGST Row Expansion
+
+**File**: `accounting_ledger_service/impl/Accrual.py`, lines 156–167
+
+When from_state == to_state (intra-state transaction), two GST components apply: CGST and SGST. The hook duplicates such rows and tags one as `CGST` and the duplicate as `SGST`. Inter-state rows get tagged as `IGST`. This doubles the row count for intra-state GST transactions.
+
+### `ProvisionalBase.populateClientGL` — Parameterised GL Code Lookup
+
+**File**: `accounting_ledger_service/impl/Provisional.py`, lines 66–87
+
+Provisional entries support parameterised GL code selection. Each `masterglclientglmap` record can have `input_params` — a JSON array of `{column: value}` dicts. The method iterates these conditions against the current row. The **first matching** condition wins. If no conditions match, falls back to the default `client_gl_account_code`. This is used to route different transaction types to different GL codes within the same compensation header.
+
+---
+
+## 6. Configuration & Environment Setup
+
+### Runtime Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `FLASK_APP` | Yes | Must be `accounting_ledger_service/controller.py` |
+| `FLASK_RUN_PORT` | Yes | Port to expose; production default is `10087` |
+| `FLASK_ENV` | Yes | `development` or `production` |
+| `DEPLOYMENT_TYPE` | Yes | `PROD` enables production Flask environment |
+| `AWS_DEFAULT_REGION` | Yes | AWS region; default in run.sh is `ap-south-1` |
+| `service_name` | Yes | Must be `accounting_ledger` (used by `property-fetcher`) |
+| `resources` | Yes | Must be `logger,shared` (used by internal library) |
+| `CONTAINER_NAME` | Yes | `accounting_ledger_service` (used for container identification) |
+| `ALS_PORT` | Yes (run.sh) | Port to bind on the host; mapped to container `FLASK_RUN_PORT` |
+
+### DynamoDB Properties
+
+All runtime configuration is stored in a DynamoDB `properties` table. The partition key is `<domain>#<client>#<stage>` and the sort key is `accounting_ledger#<property_key>`.
+
+Critical properties:
+
+| Property Key | Type | Description |
+|---|---|---|
+| `BulkRead.URL` | String | Base URL for paginated bulk reads |
+| `BulkRead.Method` | String | HTTP method (default `POST`) |
+| `BulkRead.Headers` | JSON template | Headers with `<domain>` and `<client>` placeholders |
+| `BULK_READ_BATCH_SIZE` | Integer | Page size for paginated API calls |
+| `Payoutcycle.ObjectRead.URL` | URL template | `<payout_cycle_id>` placeholder |
+| `Batch.ObjectRead.URL` | URL template | `<batch_id>` placeholder |
+| `accounting_date_type.mapping` | JSON | Maps `accounting_date_type` → `{object_id, attribute_id}` |
+| `FILE_READ_CHUNK_SIZE` | Integer | Pandas chunk size (default 10,000) |
+| `RoundOFF_DIGITS` | Integer | Decimal rounding (default 2) |
+| `mandatory_columns` | CSV string | Columns that must exist in output; nulled if missing |
+| `remove_duplicate_applicable_list` | JSON array | List of `task_id`s where dedup is active |
+| `duplicate_match_key_columns_by_gl_acc_rule_id` | JSON object | Per-rule dedup key columns |
+| `BatchParallelTask_core_attributes` | JSON template | `<task_id>` placeholder for batch task setup |
+| `Wait_Time_Before_Upload_Trigger` | Integer | Sleep seconds before trigger (default 30) |
+| `mock_statusupdate_payload` | JSON template | Payload template with `<batch_data>`, `<batch_id>`, `<domain>`, `<client>`, `<timestamp>` |
+| `DocumentBulkUpload.*` | Multiple | URLs, methods, headers, payloads for batch/file upload APIs |
+| `DocumentBatchProcessing.URL` | String | URL to trigger bulk processing |
+| `DocumentBatchProcessing.METHOD` | String | HTTP method (default `POST`) |
+| `<task_id>.column_convert` | JSON object | Column rename map for specific rule |
+| `<task_id>.column_to_keep` | CSV string | Columns to retain in output CSV |
+| `settlement.<task_id>.add_nature_of_payment_list` | JSON object | Incenti GL codes needing nature_of_payment for settlement |
+| `GetagentLevelDataToFile.exclude_columns` | CSV/list | Columns exempt from NaN fill in agent entitlement reads |
+
+### Internal Libraries
+
+These are fetched from an internal PyPI mirror configured in `pip.conf`:
+
+| Library | Version | Purpose |
+|---|---|---|
+| `HttpCaller` | >=1.1.2.4 | HTTP client wrapper (`CustomHttpTemplate`, `HttpImpl`) |
+| `logger` | >=1.3.1.0 | Structured logging (overrides built-in `print`) |
+| `property-fetcher` | >=1.1.4.0 | DynamoDB-backed runtime config loader |
+| `sqsSnsMessage` | >=1.1.2.0 | SQS/SNS utilities (imported but not directly invoked in reviewed code) |
+| `common-filters` | >=1.0.0.0 | Flask request/response filters (`apply_filters`) |
+| `sqsExtendedClient` | 1.0.0.0 | Extended SQS client |
+| `botoinator` | 0.0.6 | Boto3 utility |
+
+---
+
+## 7. Failure Scenarios & Debugging Guide
+
+### Common Failure Modes
+
+#### 1. `accounting datetype mapping not added in properties`
+**Cause**: `accounting_date_type.mapping` property is missing or does not contain an entry for the `gl_rule_master.accounting_date_type` value.  
+**Debug**: Check DynamoDB for the property. Verify the map includes the correct key format: `<task_id>.<accounting_date_type>` (preferred) or just `<accounting_date_type>`.  
+**Fix**: Add the correct mapping entry: `{"object_id": "payoutcycle", "attribute_id": "cycle_end_date"}`.
+
+#### 2. `gl_acc_rule_id or Stage not configured or gl_acc_rule_id not applicable`
+**Cause**: Mismatch between requested `stage_id` and the `stage` configured in `accountingglrulemaster`, or `applicable` is `False`.  
+**Debug**: Verify the GL rule master record in the platform for the tenant. The `stage` comparison is case-insensitive (`.lower()==stage_id`).  
+**Fix**: Update the GL rule master record or correct the `stage_id` header in the calling service.
+
+#### 3. `NO records found with for the requested accounting code`
+**Cause**: After all chunk processing, the output CSV is empty. Could mean: no entitlement records match the where-clause, all amounts are zero, all `accounting_date` values are null, or all records were filtered as duplicates.  
+**Debug**: Check the bulk read where-clause (e.g., `net_accrued_amount > 0`). Verify entitlement records exist for the payout cycle. Check if dedup removed everything.  
+**Fix**: Confirm upstream entitlement calculation has run.
+
+#### 4. `Error calling bulk read API for accountingledgerread`
+**Cause**: The existing ledger read (deduplication check) failed with an unexpected error.  
+**Debug**: Look at the specific exception from the API call. Check `accountingledgerread` service repository configuration.  
+**Note**: If the error message contains "No record found for object_id", it is treated as "first run" and is **not** an error.
+
+#### 5. S3 Download Failures (`storeS3FileLocally`)
+**Cause**: IAM permissions for the EC2/container role are insufficient, or the S3 object does not exist (payout cycle review hasn't generated the report yet).  
+**Debug**: Check boto3 error code in logs (`404` = file missing, `403` = permission denied). Verify the `cyclereview.document_attributes` in the payout cycle object.  
+**Fix**: Ensure the provisional calculation pipeline has completed before this service is called.
+
+#### 6. `Error creating batch` / `Error creating BatchParallelTask`
+**Cause**: The platform batch API is unreachable or returned a non-200, non-422 status.  
+**Debug**: Check `DocumentBulkUpload.CreateBatch.URL` property. Inspect HTTP response in logs.  
+**Note**: 422 "already exists" is treated as success (idempotent batch creation).
+
+#### 7. `error processing bulk CUD action`
+**Cause**: The bulk processing trigger failed (`DocumentBatchProcessing.URL` returned non-200).  
+**Debug**: Check the platform's batch processing service. Inspect batch status for `batch_id = accounting_<cycleid>`.  
+**Note**: At this point the CSV file has already been uploaded — retrying the full flow will attempt batch recreation (idempotent) and re-upload.
+
+### Unsafe Assumptions / Edge Cases
+
+| Scenario | Risk |
+|---|---|
+| Multiple concurrent calls for same payout cycle + rule | Race condition in dedup: both calls read existing records simultaneously, both may proceed |
+| Large payout cycles (>1M agents) | Temp CSV files can grow very large; container disk space may be insufficient |
+| GST `from_state`/`to_state` not in `gstglmap` | Raises exception at `calcClientGLCode`; all agents in that state will fail |
+| `accounting_txn_id` not populated | Intentional — this field is expected to be auto-generated by the platform |
+| `nature_of_payment` null for settlement | Has fallback: defaults to empty string for GL code lookup |
+
+### Debugging Using Logs
+
+The service uses the internal `logger` library (overrides built-in `print`). All `print()` calls are structured log statements.
+
+Key log patterns to search for:
+
+```bash
+# Request start
+grep "EVENT:" logs
+
+# GL cache size (implicit in HTTP 200 responses)
+grep "accounting_gl_rule_master" logs
+
+# Chunk processing progress
+grep "DataFrame has been successfully saved" logs
+
+# Deduplication
+grep "first time records" logs   # First-run dedup (no existing records)
+
+# Batch upload progress
+grep "processing complete" logs   # Successful completion
+
+# Errors
+grep "logtype='fatal'" logs       # Fatal errors from controller
 ```
-</details>
 
 ---
 
-**Q2.** Write a query to get the `city` nested inside `address` inside `core_attributes` as plain text.
+## 8. Operational & Infra Considerations
 
-<details><summary>Answer</summary>
+### Startup Sequence
 
-```sql
-SELECT core_attributes->'address'->>'city' AS city FROM agent;
+1. Container starts Flask with `flask run --host=0.0.0.0` on `FLASK_RUN_PORT`
+2. No warm-up or pre-loading occurs — GL master data is fetched on the **first request**
+3. Timezone is set to `Asia/Kolkata` (IST) in the Docker image
+
+### Shutdown
+
+- Flask process handles `SIGTERM` gracefully (standard Flask behaviour)
+- No in-flight request state needs cleanup (all processing is synchronous within a request)
+- Temp CSV files in the container's working directory may be orphaned if the process is killed mid-request (cleanup is in the `finally` block of `AccountLedger.start()`)
+
+### Health Check
+
+There is **no dedicated `/health` endpoint**. Health is implicitly confirmed by the container being reachable on the exposed port.
+
+> **Inferred from code**: For production, add a simple `/health` GET route. Alerting should be based on error rates in logs.
+
+### Performance Profile
+
+| Operation | Typical impact |
+|---|---|
+| GLCache init (per request) | 2 paginated API calls at startup; cost grows with master data size |
+| BulkRead API calls | Dominant time cost; proportional to number of entitlement records |
+| S3 download (Provisional) | Network-bound; depends on S3 region proximity |
+| Pandas chunked processing | CPU-bound; `FILE_READ_CHUNK_SIZE=10000` is a key tuning knob |
+| Sleep before trigger | Fixed `Wait_Time_Before_Upload_Trigger` seconds (default 30s) added to every request |
+
+### Scaling Considerations
+
+- The service is **stateless** between requests — horizontal scaling is safe
+- **Concurrency within a single payout cycle should be avoided**: multiple simultaneous requests for the same `payout_cycle_id` + `gl_acc_rule_id` may create duplicate batch records or race in deduplication
+- Disk I/O is significant: ensure the container's ephemeral storage is sufficient for large CSVs
+- The 30-second sleep is a hard bottleneck per invocation; for large payout cycles with many rules, this significantly extends total processing time
+
+### Resource Sensitivity
+
+| Resource | Sensitivity |
+|---|---|
+| Disk (ephemeral) | HIGH — temp CSV files created in working directory |
+| Memory | MEDIUM — Pandas DataFrames held per chunk; GLCache held per request |
+| Network | HIGH — multiple paginated API calls + S3 download |
+| CPU | LOW-MEDIUM — Pandas operations on chunks |
+
+---
+
+## 9. Local Development & Runbook
+
+### Prerequisites
+
+- Python 3.10
+- Docker (for container-based runs)
+- AWS credentials configured (`~/.aws/credentials` or env vars) with access to:
+  - DynamoDB table (`properties`)
+  - S3 (for provisional stage only)
+- Access to the internal PyPI mirror (configure `pip.conf` with your credentials)
+- Network access to the platform's BulkRead, Object Read, and Batch APIs
+
+### Running Directly (without Docker)
+
+```bash
+cd accounting-ledger-service-develop/
+
+# Install dependencies (internal pip mirror required)
+pip install -r requirements.txt
+
+# Set environment variables
+export service_name=accounting_ledger
+export resources=logger,shared
+export FLASK_APP=accounting_ledger_service/controller.py
+export FLASK_RUN_PORT=10087
+export AWS_DEFAULT_REGION=ap-south-1
+
+# Run
+cd accounting_ledger_service
+flask run --host=0.0.0.0
 ```
-</details>
 
----
+### Running via Docker
 
-**Q3.** What is the difference between `->` and `->>` in PostgreSQL JSONB? When would you use each?
+```bash
+cd accounting-ledger-service-develop/
 
-<details><summary>Answer</summary>
+# Build image
+docker build -t accounting_ledger_service .
 
-- `->` returns JSONB (preserves type; can be used as input to JSONB functions)
-- `->>` returns TEXT (for string comparisons, WHERE clauses, display)
-
-Use `->` when passing to `jsonb_set()`, `@>`, or further navigation.
-Use `->>` in `WHERE col->>'field' = 'value'` comparisons.
-</details>
-
----
-
-**Q4.** Write a query that selects all agents who are in `stage_id = 'active'` (where `stage` is a top-level JSONB column).
-
-<details><summary>Answer</summary>
-
-```sql
-SELECT * FROM agent WHERE stage->>'stage_id' = 'active';
--- or using -> then ->>:
-SELECT * FROM agent WHERE (stage->>'stage_id') = 'active';
+# Run (replace ALS_PORT with your local port)
+export ALS_PORT=10087
+bash run.sh
 ```
-</details>
 
----
+### Testing a Single GL Rule
 
-### Set B — Intermediate (UPDATE Patterns)
+Use the sample payloads in `test/`:
 
-**Q5.** Using `jsonb_set`, write an UPDATE to add a field `"email_verified": true` inside `core_attributes` of the `agent` table for all agents where `core_attributes->>'agent_code' = 'A001'`. Create the key if missing.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE agent
-SET core_attributes = jsonb_set(
-    core_attributes,
-    '{email_verified}',
-    'true'::jsonb,
-    true
-)
-WHERE core_attributes->>'agent_code' = 'A001';
+```bash
+# Example: trigger COMMACCRUEAGT rule
+curl --location --request POST \
+  'http://localhost:10087/accounting-ledger-service/<payout_cycle_id>/COMMACCRUEAGT' \
+  --header 'client: <your_client>' \
+  --header 'domain: incentihub' \
+  --header 'stage_id: accrual' \
+  --header 'stage: CLIENT_SB'
 ```
-</details>
 
----
+Or run `service_handler.py` directly for local debugging (edit the `test` dict at the bottom of the file):
 
-**Q6.** Write an UPDATE to merge `{"mobile_verified": false}` into `core_attributes` for all agents, but only if `mobile_verified` key does NOT already exist.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE agent
-SET core_attributes = COALESCE(core_attributes, '{}'::jsonb) || '{"mobile_verified": false}'::jsonb
-WHERE NOT (COALESCE(core_attributes, '{}'::jsonb) ? 'mobile_verified');
+```bash
+cd accounting_ledger_service
+python service_handler.py
 ```
-</details>
 
----
+### Running Unit Tests
 
-**Q7.** Using `jsonb_set`, update the nested path `processor_schema -> preprocessor -> configuration -> lambda` to `"my-lambda"` in the `service_registry` table for a specific `service_repository_id`.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE service_registry
-SET processor_schema = jsonb_set(
-    processor_schema,
-    '{preprocessor,configuration,lambda}',
-    '"my-lambda"',
-    true
-)
-WHERE service_repository_id = 'mysvc';
+```bash
+cd Tests/
+python -m pytest test_Accrual.py test_Adjustment.py test_Provisional.py test_Settlement.py test_Util.py -v
 ```
-</details>
+
+### Test Data & Mock Dependencies
+
+- `test/event*.json` files contain sample event payloads for each GL rule type
+- `test/data.json` contains sample entitlement data
+- For Provisional tests, mock the S3 download or provide a local CSV at the expected path
+
+### Common Developer Mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Wrong `stage_id` header | `gl_acc_rule_id not applicable` error | Check GL rule master `stage` field |
+| Missing DynamoDB property | `KeyError` or `NoneType` exceptions | Add property to DynamoDB for the tenant |
+| Running from wrong directory | `ModuleNotFoundError` | Run flask from inside `accounting_ledger_service/` |
+| pip.conf not configured | `pip install` fails | Configure internal PyPI mirror credentials |
+| S3 file not present | Silent empty `filepath` + eventual exception | Ensure provisional calculation pipeline ran first |
+| `accounting_date_type` not in mapping | Exception on `AccountLedger.__init__` | Add correct entry to `accounting_date_type.mapping` property |
+
+### Adding a New GL Rule
+
+1. Determine which base class the new rule inherits from:
+   - Agent-level data from API → subclass `AgentLevelAccountLedger`
+   - Report file from S3 → subclass `ProvisionalBase`
+2. Implement at minimum:
+   - `getPayload()` — BulkRead where-clause and select-clause
+   - `getObjctId()` — the object ID to query
+   - `agentLevelDataToFile()` — callback to transform API response to CSV
+   - `populateAmtAndDate()` — set `amount` and `accounting_date` columns
+   - `populateRuleSpecificData()` (optional) — override if GL code lookup differs from standard
+3. Add `gl_acc_rule_id` handling in `FactoryPattern.getType()` (`impl/` class must be imported)
+4. Add GL rule master record in the platform (with correct `stage`, `applicable=True`, GL codes configured)
+5. Configure `accounting_date_type.mapping` in DynamoDB for the new rule
+6. Add unit test in `Tests/` mirroring the existing test structure
 
 ---
 
-**Q8.** You have a `document_attributes` JSONB column. Write an UPDATE that:
-1. Adds key `"passport": {...details...}` to `document_attributes`
-2. Also appends `"passport"` to the `sequence` array inside `document_attributes`
-Do it only if `"passport"` is not already present.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE object_repository
-SET document_attributes = jsonb_set(
-    COALESCE(document_attributes, '{}'::jsonb)
-      || '{"passport": {"datatype": "Document", "label_id": "Passport", "attribute_name": "passport"}}'::jsonb,
-    '{sequence}',
-    COALESCE(document_attributes->'sequence', '[]'::jsonb) || '["passport"]'::jsonb
-)
-WHERE object_id = 'agent'
-AND NOT (COALESCE(document_attributes, '{}'::jsonb) ? 'passport');
-```
-</details>
-
----
-
-**Q9.** What does `allowed_stages::jsonb ? 'active'` do when `allowed_stages` is stored as a `TEXT` column?
-
-<details><summary>Answer</summary>
-
-It first casts the text column to `jsonb`, then checks whether the JSON value (object or array) contains the key/element `'active'`. For a JSON array like `["active","inactive"]`, `? 'active'` returns `true`. You need the `::jsonb` cast since `?` requires a JSONB operand.
-</details>
-
----
-
-### Set C — Advanced (Aggregation, Arrays, and CTEs)
-
-**Q10.** Write a query that returns a single JSONB object with the structure:
-```json
-{"total_agents": 100, "active_agents": 75}
-```
-using `jsonb_build_object` and subqueries on the `agent` table.
-
-<details><summary>Answer</summary>
-
-```sql
-SELECT jsonb_build_object(
-    'total_agents', COUNT(*),
-    'active_agents', COUNT(*) FILTER (WHERE stage->>'stage_id' = 'active')
-) FROM agent;
-```
-</details>
-
----
-
-**Q11.** The `supervisormap` column in `agent` is a JSONB array. Each element has `core_attributes.mapping_status`. Write a query that returns each agent code alongside all their **active** supervisor codes (as a JSONB array).
-
-<details><summary>Answer</summary>
-
-```sql
-SELECT
-    core_attributes->>'agent_code' AS agent_code,
-    jsonb_agg(sup->'core_attributes'->>'code') AS active_supervisors
-FROM agent ag,
-     jsonb_array_elements(ag.supervisormap) AS sup
-WHERE sup->'core_attributes'->>'mapping_status' = 'Active'
-GROUP BY core_attributes->>'agent_code';
-```
-</details>
-
----
-
-**Q12.** Write a CTE-based UPDATE that:
-1. Checks if `si_input_schema -> 'properties' -> 'agent' ? 'new_field'` exists in `service_interaction`
-2. If NOT — adds `{"new_field": {"type": "string"}}` at that path
-3. Returns the `si_id` and whether it was `already_exists` or `newly_added`
-
-<details><summary>Answer</summary>
-
-```sql
-WITH check_and_update AS (
-    SELECT
-        si_id, si_version,
-        CASE
-            WHEN si_input_schema->'properties'->'agent' ? 'new_field' THEN 'already_exists'
-            ELSE 'newly_added'
-        END AS status,
-        CASE
-            WHEN si_input_schema->'properties'->'agent' ? 'new_field' THEN si_input_schema
-            ELSE jsonb_set(
-                si_input_schema,
-                '{properties,agent,new_field}',
-                '{"type":"string"}'::jsonb,
-                true
-            )
-        END AS updated_schema
-    FROM service_interaction
-    WHERE object_id = 'agent'
-)
-UPDATE service_interaction si
-SET si_input_schema = c.updated_schema
-FROM check_and_update c
-WHERE si.si_id = c.si_id AND si.si_version = c.si_version
-RETURNING si.si_id, c.status AS action_taken;
-```
-</details>
-
----
-
-**Q13.** Write a PL/pgSQL function `get_agent_summary(p_stage TEXT)` that:
-- Takes a stage name as input
-- Returns `TABLE(data jsonb)` with each row being `{"agent_code": "...", "stage": "..."}`
-- Uses `jsonb_agg` and `jsonb_build_object`
-
-<details><summary>Answer</summary>
-
-```sql
-CREATE OR REPLACE FUNCTION get_agent_summary(p_stage TEXT)
-RETURNS TABLE(data jsonb)
-LANGUAGE plpgsql
-AS $function$
-BEGIN
-    RETURN QUERY
-    SELECT jsonb_build_object(
-        'agent_code', core_attributes->>'agent_code',
-        'stage', stage->>'stage_id'
-    )
-    FROM agent
-    WHERE stage->>'stage_id' = p_stage;
-END;
-$function$;
-
--- Usage:
-SELECT * FROM get_agent_summary('active');
-```
-</details>
-
----
-
-**Q14.** Write a query to check whether the `sequence` array inside `document_attributes` **contains** the string `"forms"`, and update it to append `"forms"` only if it doesn't.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE object_repository
-SET document_attributes = jsonb_set(
-    document_attributes,
-    '{sequence}',
-    (document_attributes->'sequence') || '"forms"'::jsonb,
-    false
-)
-WHERE object_id = 'agentindividualdetails'
-AND NOT (document_attributes->'sequence' @> '"forms"');
-```
-</details>
-
----
-
-**Q15.** What does `jsonb_array_elements(col) WITH ORDINALITY AS arr(elem, ord)` provide, and when would you use it?
-
-<details><summary>Answer</summary>
-
-It unnests a JSONB array into rows, providing:
-- `elem` — the JSONB element
-- `ord` — a 1-based integer position (ordinality)
-
-Use it when you need the **index** of each element (e.g., to sort, to reference elements by position, or to process first/last elements). Without `WITH ORDINALITY` you only get the element value, not its position.
-</details>
-
----
-
-### Set D — Schema Migration Scenarios (Deployment-Realistic)
-
-**Q16.** You need to add a new attribute `"kyc_verified"` to `object_repository.core_attributes` for `object_id = 'agent'`. The attribute should have structure: `{"datatype":"Boolean","label_id":"KYC Verified","is_pii":false,"attribute_name":"kyc_verified"}`. Write an idempotent query.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE object_repository
-SET core_attributes = jsonb_set(
-    core_attributes,
-    '{kyc_verified}',
-    '{"datatype":"Boolean","label_id":"KYC Verified","is_pii":false,"attribute_name":"kyc_verified"}'::jsonb,
-    true
-)
-WHERE object_id = 'agent'
-AND NOT (COALESCE(core_attributes, '{}'::jsonb) ? 'kyc_verified');
-```
-</details>
-
----
-
-**Q17.** You have a `service_registry.processor_schema` that looks like:
-```json
-{"preprocessor": {"type": "lambda", "configuration": {"lambda": "old-lambda"}}}
-```
-Write an UPDATE to change **only** the lambda name to `"new-lambda"` without touching the rest.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE service_registry
-SET processor_schema = jsonb_set(
-    processor_schema,
-    '{preprocessor,configuration,lambda}',
-    '"new-lambda"'::jsonb,
-    false
-)
-WHERE service_repository_id = 'mysvc';
-```
-</details>
-
----
-
-**Q18.** Given a `statuses` JSONB column containing a workflow config, write an idempotent query to add a new status `"pendingkyc"` under the `"onboarding"` key, only if it doesn't exist already.
-
-<details><summary>Answer</summary>
-
-```sql
-UPDATE object_repository
-SET statuses = CASE
-    WHEN statuses->'onboarding' ? 'pendingkyc' THEN statuses
-    ELSE jsonb_set(
-        statuses,
-        '{onboarding,pendingkyc}',
-        '{"final":false,"initial":false,"publish":true,
-          "label_id":"Pending KYC","status_id":"pendingkyc",
-          "status_name":"Pending KYC","mandatory_attributes":[]}'::jsonb,
-        true
-    )
-END
-WHERE object_id = 'agent'
-AND statuses ? 'onboarding';
-```
-</details>
-
----
-
-## Quick Reference Card
+## Appendix — GL Rule ID Reference
 
 ```
-JSONB OPERATORS:
-  ->     Get field as JSONB          col->'key'
-  ->>    Get field as TEXT           col->>'key'
-  #>     Get path as JSONB           col #> '{a,b,c}'
-  #>>    Get path as TEXT            col #>> '{a,b,c}'
-  @>     Contains (superset)         col @> '{"k":"v"}'
-  <@     Contained by               '{"k":"v"}' <@ col  
-  ?      Key exists                  col ? 'key'
-  ?|     Any key exists              col ?| ARRAY['k1','k2']
-  ?&     All keys exist              col ?& ARRAY['k1','k2']
-  ||     Merge/Concat               col1 || col2
+Provisional Stage:
+  PRVNCTXN      Child transaction ledger (normal)
+  PRVNCTXNREC   Child transaction ledger (reversal)
+  PRVNPTXN      Parent transaction ledger (normal)
+  PRVNPTXNREC   Parent transaction ledger (reversal)
+  PRVNAGT       Agent-level provisional (normal)
+  PRVNAGTREC    Agent-level provisional (reversal)
 
-JSONB FUNCTIONS:
-  jsonb_set(target, path, val, create)  Update nested field
-  jsonb_build_object(k,v,k,v,...)       Build object inline
-  jsonb_build_array(v1,v2,...)          Build array inline
-  jsonb_agg(expr)                       Aggregate to array
-  jsonb_array_elements(arr)             Unnest array to rows
-  jsonb_array_length(arr)               Count array elements
-  jsonb_typeof(val)                     'object'/'array'/etc
+Accrual Stage:
+  COMMACCRUEAGT       Agent payable (normal)
+  COMMACCRUEAGTREC    Agent payable (reversal)
+  COMMACCRUEWITHOLD   Withholding tax (normal)
+  COMMACCRUEWITHOLDREC Withholding tax (reversal)
+  COMMACCRUELT        Local tax (normal)
+  COMMACCRUELTREC     Local tax (reversal)
+  COMMACCRUEVATRCM    GST Reverse Charge Mechanism (normal)
+  COMMACCRUEVATRCMREC GST Reverse Charge Mechanism (reversal)
+  COMMACCRUEVATFCM    GST Forward Charge Mechanism (normal)
+  COMMACCRUEVATFCMREC GST Forward Charge Mechanism (reversal)
+  TaxableCommExtra    Taxable commission adjustment (extra)
+  TaxableCommLess     Taxable commission adjustment (less/reversal)
+  NonTaxableCommExtra Non-taxable commission adjustment (extra)
+  NonTaxableCommLess  Non-taxable commission adjustment (less/reversal)
 
-COMMON PATTERNS:
-  Safe add:   COALESCE(col,'{}'::jsonb) || '{"k":"v"}'::jsonb
-  Guard:      WHERE NOT (COALESCE(col,'{}'::jsonb) ? 'key')
-  Append arr: col || '["item"]'::jsonb
-  Path check: col #> '{a,b}' ? 'key'
-  Array has:  col->'arr' @> '"item"'
+Settlement Stage:
+  COMMPAY     Bank payment entries
+  COMMPAYREJ  Payment rejection (reversal)
+  COMMPAYREJ1 Payment rejection variant (reversal)
 ```
